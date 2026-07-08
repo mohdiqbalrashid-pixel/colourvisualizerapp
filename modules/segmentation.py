@@ -44,79 +44,88 @@ def create_wall_mask(image: np.ndarray, seed_point: tuple[int, int], tolerance: 
     return final_mask
 
 
-def generate_auto_regions(image: np.ndarray, num_regions: int = 5) -> list[np.ndarray]:
+def generate_auto_regions(image: np.ndarray, num_regions: int = 3) -> list[np.ndarray]:
     """
-    Uses 5D Spatial K-Means clustering and geometric logic to auto-detect walls.
+    Uses Graph-Based Segmentation and Canny Edge Fencing to auto-detect walls flawlessly.
     """
     height, width = image.shape[:2]
     
-    # 1. Shrink image slightly for lightning-fast processing
-    scale = 320.0 / max(width, height)
+    # 1. Downscale for lightning-fast processing
+    scale = 400.0 / max(width, height)
     new_w, new_h = int(width * scale), int(height * scale)
     small_img = cv2.resize(image, (new_w, new_h))
 
-    # 2. Edge-Preserving Blur (Eradicates shadows/textures, keeps doorframes sharp)
-    smooth_img = cv2.bilateralFilter(small_img, d=9, sigmaColor=75, sigmaSpace=75)
-    lab_img = cv2.cvtColor(smooth_img, cv2.COLOR_RGB2LAB)
+    # 2. Extract Hard Structural Edges (Doorframes, Windows, Ceilings)
+    # We build a mathematical "fence" that stops the detection from bleeding over
+    gray = cv2.cvtColor(small_img, cv2.COLOR_RGB2GRAY)
+    edges = cv2.Canny(gray, 30, 100)
+    edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=2)
 
-    # 3. Construct 5D Features: [L, a, b, X, Y]
-    # This prevents the floor and ceiling from merging if they are the same color
-    y_coords, x_coords = np.mgrid[0:new_h, 0:new_w]
-    spatial_weight = 0.65  # Controls how strictly we enforce physical boundaries
+    # 3. Graph-Based Segmentation (Felzenszwalb's Algorithm)
+    # This understands that a shadow on a wall is a smooth slope, keeping the wall whole.
+    blurred = cv2.bilateralFilter(small_img, d=9, sigmaColor=75, sigmaSpace=75)
     
-    x_scaled = (x_coords / new_w) * 255.0 * spatial_weight
-    y_scaled = (y_coords / new_h) * 255.0 * spatial_weight
+    try:
+        # k=400 heavily favors creating large, contiguous surfaces (walls) rather than tiny fragments
+        segmenter = cv2.ximgproc.segmentation.createGraphSegmentation(
+            sigma=0.5, k=400, min_size=int(new_w * new_h * 0.08)
+        )
+        labels = segmenter.processImage(blurred)
+    except AttributeError:
+        # Failsafe: Fallback to K-Means if Streamlit cloud environment hiccups
+        lab_img = cv2.cvtColor(blurred, cv2.COLOR_RGB2LAB)
+        pixel_values = lab_img.reshape((-1, 3)).astype(np.float32)
+        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
+        _, labels, _ = cv2.kmeans(pixel_values, 6, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
+        labels = labels.reshape((new_h, new_w))
 
-    features = np.dstack((lab_img, x_scaled, y_scaled))
-    pixel_values = features.reshape((-1, 5)).astype(np.float32)
-
-    # 4. Execute Clustering
-    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
-    _, labels, _ = cv2.kmeans(pixel_values, num_regions, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
-    labels = labels.reshape((new_h, new_w))
+    unique_labels, counts = np.unique(labels, return_counts=True)
+    sorted_labels = [l for _, l in sorted(zip(counts, unique_labels), reverse=True)]
 
     masks = []
-    for i in range(num_regions):
-        mask_small = np.where(labels == i, 255, 0).astype(np.uint8)
+    total_area = new_w * new_h
 
-        # Keep only the largest solid block in this cluster (deletes random scattered pixels)
+    for label in sorted_labels:
+        mask_small = np.where(labels == label, 255, 0).astype(np.uint8)
+        
+        # 4. Enforce the Edge Fence (Cut out the doorframes/windows)
+        mask_small = cv2.bitwise_and(mask_small, cv2.bitwise_not(edges))
+        
+        # Clean up microscopic fragments left behind by the fence subtraction
+        kernel = np.ones((5, 5), np.uint8)
+        mask_small = cv2.morphologyEx(mask_small, cv2.MORPH_OPEN, kernel)
+        
+        # Extract the single largest continuous chunk in this label
         num_labels, labels_im, stats, _ = cv2.connectedComponentsWithStats(mask_small, connectivity=8)
         if num_labels > 1:
             largest_label = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
-            clean_mask_small = np.where(labels_im == largest_label, 255, 0).astype(np.uint8)
-        else:
-            clean_mask_small = mask_small
+            mask_small = np.where(labels_im == largest_label, 255, 0).astype(np.uint8)
 
-        # 5. Geometric Filtering
-        area = np.count_nonzero(clean_mask_small)
-        total_area = new_w * new_h
+        area = np.count_nonzero(mask_small)
         
-        # Rule A: Surface must take up at least 12% of the room
-        if area / total_area < 0.12:
-            continue 
+        # Rule A: Surface must take up at least 8% of the room to be considered a main wall
+        if area / total_area < 0.08: 
+            continue
 
-        # Rule B: Gravity Check. 
-        # Check where the mask touches the edges of the photo.
-        touches_top = np.any(clean_mask_small[0:5, :] > 0)
-        touches_left = np.any(clean_mask_small[:, 0:5] > 0)
-        touches_right = np.any(clean_mask_small[:, -5:] > 0)
-        touches_bottom = np.any(clean_mask_small[-5:, :] > 0)
+        # 5. Gravity Check (Ignore Floors/Rugs)
+        touches_top = np.any(mask_small[0:5, :] > 0)
+        touches_left = np.any(mask_small[:, 0:5] > 0)
+        touches_right = np.any(mask_small[:, -5:] > 0)
+        touches_bottom = np.any(mask_small[-5:, :] > 0)
 
-        # If it ONLY touches the bottom of the photo, it is the floor/rug. Discard it.
+        # If it ONLY touches the bottom of the photo, it is the floor. Discard it.
         if touches_bottom and not (touches_top or touches_left or touches_right):
             continue
 
-        # 6. Scale back up and smooth edges
-        mask_large = cv2.resize(clean_mask_small, (width, height), interpolation=cv2.INTER_NEAREST)
-        
-        # Soften the jagged mathematical edges for realistic painting
-        mask_large = cv2.GaussianBlur(mask_large, (11, 11), 0)
+        # 6. Scale back to original massive resolution and feather edges for realism
+        mask_large = cv2.resize(mask_small, (width, height), interpolation=cv2.INTER_NEAREST)
+        mask_large = cv2.GaussianBlur(mask_large, (15, 15), 0)
         _, mask_large = cv2.threshold(mask_large, 127, 255, cv2.THRESH_BINARY)
 
         masks.append(mask_large)
+        
+        # Stop once we've found the top requested surfaces
+        if len(masks) == num_regions:
+            break
 
-    # Sort by size so Surface 1 is always the biggest wall
-    masks.sort(key=np.count_nonzero, reverse=True)
-    
-    # Return the top 3 legitimate surfaces
-    return masks[:3]
+    return masks
