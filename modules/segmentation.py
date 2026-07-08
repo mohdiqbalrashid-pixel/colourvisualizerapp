@@ -1,83 +1,48 @@
-from __future__ import annotations
-
-import cv2
+import streamlit as st
+import replicate
+import requests
 import numpy as np
+import cv2
+from io import BytesIO
+from PIL import Image
 
-from modules.config import (
-    MASK_EXPAND_PIXELS,
-    MASK_SHRINK_PIXELS,
-    MASK_SMOOTH_KERNEL
-)
+# Note: You would need to add 'replicate' to your requirements.txt
 
-def _generate_grabcut_mask(
-    image: np.ndarray, 
-    seed_point: tuple[int, int], 
-    radius: int = 40
-) -> np.ndarray:
+def get_sam_mask_from_api(image: np.ndarray, click_point: tuple[int, int]) -> np.ndarray:
     """
-    Runs GrabCut segmentation surrounding a targeted seed coordinates location.
+    Sends the image and click coordinates to Meta's SAM via Replicate API.
+    Returns a perfect, context-aware AI mask.
     """
-    height, width = image.shape[:2]
+    x, y = click_point
     
-    mask = np.zeros((height, width), np.uint8)
-    bgd_model = np.zeros((1, 65), np.float64)
-    fgd_model = np.zeros((1, 65), np.float64)
+    # 1. Convert numpy image to a format we can send over the internet
+    img_pil = Image.fromarray(image)
+    img_byte_arr = BytesIO()
+    img_pil.save(img_byte_arr, format='JPEG')
+    img_byte_arr = img_byte_arr.getvalue()
     
-    # Mark overall matrix as probable background
-    mask[:] = cv2.GC_PR_BGD
-    
-    # Assert clicked coordinate perimeter as definite foreground
-    x, y = seed_point
-    cv2.circle(mask, (x, y), radius, cv2.GC_FGD, -1)
-    
-    # Boundary container initialization
-    rect = (5, 5, width - 10, height - 10)
-    
+    # 2. Call the AI Model (Using a standard SAM endpoint on Replicate)
+    # The API key is securely stored in Streamlit Cloud's settings
     try:
-        cv2.grabCut(image, mask, rect, bgd_model, fgd_model, 3, cv2.GC_INIT_WITH_MASK)
-        binary_mask = np.where((mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD), 255, 0).astype("uint8")
-    except Exception:
-        # Emergency robust fallback to clean array if process interrupts
-        binary_mask = np.zeros((height, width), dtype=np.uint8)
-        
-    return binary_mask
-
-def _refine_mask(image: np.ndarray, raw_mask: np.ndarray) -> np.ndarray:
-    """
-    Snaps raw masks directly to hard geometric structural components.
-    """
-    guide = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
-    
-    try:
-        refined_mask = cv2.ximgproc.guidedFilter(
-            guide=guide, src=raw_mask, radius=MASK_SMOOTH_KERNEL, eps=1e-4
+        output_url = replicate.run(
+            "pablodawson/segment-anything-model-automatic:latest",
+            input={
+                "image": img_byte_arr,
+                "input_points": f"[{x}, {y}]",
+                "input_labels": "[1]" # 1 means "foreground"
+            }
         )
-    except AttributeError:
-        # Graceful degradation fallback if binary bindings mismatch
-        refined_mask = cv2.GaussianBlur(raw_mask, (MASK_SMOOTH_KERNEL, MASK_SMOOTH_KERNEL), 0)
-    
-    # Structural morph transformations to fill micro-voids
-    if MASK_EXPAND_PIXELS > 0:
-        kernel = np.ones((MASK_EXPAND_PIXELS, MASK_EXPAND_PIXELS), np.uint8)
-        refined_mask = cv2.dilate(refined_mask, kernel, iterations=1)
         
-    if MASK_SHRINK_PIXELS > 0:
-        kernel = np.ones((MASK_SHRINK_PIXELS, MASK_SHRINK_PIXELS), np.uint8)
-        refined_mask = cv2.erode(refined_mask, kernel, iterations=1)
+        # 3. Download the resulting mask and convert it back to an OpenCV array
+        response = requests.get(output_url)
+        mask_img = Image.open(BytesIO(response.content)).convert("L")
+        return np.array(mask_img)
         
-    return np.clip(refined_mask, 0, 255).astype(np.uint8)
+    except Exception as e:
+        st.error(f"AI API Error: {e}")
+        return np.zeros(image.shape[:2], dtype=np.uint8)
 
-def create_wall_mask(image_np: np.ndarray, seed_point: tuple[int, int]) -> np.ndarray:
-    """
-    Primary interface gateway executing surface discovery calculations.
-    """
-    height, width = image_np.shape[:2]
-    x, y = seed_point
-    
-    if not (0 <= x < width and 0 <= y < height):
-        return np.zeros((height, width), dtype=np.uint8)
-
-    raw_mask = _generate_grabcut_mask(image_np, (x, y))
-    final_mask = _refine_mask(image_np, raw_mask)
-    
-    return final_mask
+def create_wall_mask(image: np.ndarray, seed_point: tuple[int, int]) -> np.ndarray:
+    """Main entry point for preview.py"""
+    with st.spinner("Meta SAM is analyzing room geometry..."):
+        return get_sam_mask_from_api(image, seed_point)
