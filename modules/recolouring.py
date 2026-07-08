@@ -11,44 +11,48 @@ def apply_paint(
     strength: float = DEFAULT_PAINT_STRENGTH
 ) -> np.ndarray:
     """
-    Applies paint using advanced Multiply and Screen blending modes
-    for photorealistic shadow and highlight retention.
+    Applies solid paint by replacing the color channels entirely 
+    while shifting the luminance to preserve texture and shadows.
     """
     if mask.ndim == 3:
         mask = cv2.cvtColor(mask, cv2.COLOR_RGB2GRAY)
     
-    # Create the solid color layer
-    solid_color = np.full_like(image, target_rgb, dtype=np.float32)
-    img_float = image.astype(np.float32)
+    # 1. Convert to LAB space (L = Light/Shadows, A/B = Color)
+    image_lab = cv2.cvtColor(image, cv2.COLOR_RGB2LAB).astype(np.float32)
+    l_channel, a_channel, b_channel = cv2.split(image_lab)
     
-    # Normalize original image for calculations (0.0 to 1.0)
-    img_normalized = img_float / 255.0
-    color_normalized = solid_color / 255.0
+    # 2. Get target LAB values for the Jotun Paint
+    target_img = np.uint8([[target_rgb]])
+    target_lab = cv2.cvtColor(target_img, cv2.COLOR_RGB2LAB)[0][0].astype(np.float32)
+    target_l, target_a, target_b = target_lab
     
-    # 1. MULTIPLY BLEND (Perfect for shadows)
-    # Darkens the new color based on the physical shadows in the room
-    multiply_blend = img_normalized * color_normalized
+    bool_mask = mask > 0
+    if not np.any(bool_mask):
+        return image.copy()
+        
+    # 3. Luminance Shifting
+    # We find the average shadow/light of the wall, and shift it to match the paint's brightness.
+    # This preserves the variance (the texture of the wall) but changes the base brightness.
+    masked_l = l_channel[bool_mask]
+    avg_l = np.mean(masked_l)
+    l_shift = target_l - avg_l
     
-    # 2. SCREEN BLEND (Perfect for highlights)
-    # Ensures glare from windows/lights reflects realistically off the new paint
-    screen_blend = 1.0 - (1.0 - img_normalized) * (1.0 - color_normalized)
+    new_l = np.clip(l_channel + l_shift, 0, 255)
     
-    # 3. LUMINANCE MASKING (The secret sauce)
-    # We use the original wall's brightness to mix the Multiply and Screen layers.
-    gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
-    gray_3d = np.dstack([gray, gray, gray])
+    # 4. OVERWRITE the color completely (This fixes the "transparent" look)
+    l_channel[bool_mask] = new_l[bool_mask]
+    a_channel[bool_mask] = target_a
+    b_channel[bool_mask] = target_b
     
-    # Combine them: Dark areas get the Multiply blend; bright areas get the Screen blend.
-    blended_normalized = (multiply_blend * (1.0 - gray_3d)) + (screen_blend * gray_3d)
+    # 5. Convert back to standard RGB image
+    merged_lab = cv2.merge([l_channel, a_channel, b_channel]).astype(np.uint8)
+    painted_rgb = cv2.cvtColor(merged_lab, cv2.COLOR_LAB2RGB)
     
-    # Convert back to standard image format
-    blended_final = (blended_normalized * 255.0).clip(0, 255).astype(np.uint8)
-    
-    # Feather the mask for seamless edges
-    soft_mask = cv2.GaussianBlur(mask, (15, 15), 0).astype(np.float32) / 255.0
+    # 6. Feather the edges so it blends smoothly into corners and doorframes
+    soft_mask = cv2.GaussianBlur(mask, (7, 7), 0).astype(np.float32) / 255.0
     soft_mask_3d = np.dstack([soft_mask, soft_mask, soft_mask]) * strength
     
-    # Apply the paint only where the mask dictates
-    final_output = (blended_final * soft_mask_3d + image * (1.0 - soft_mask_3d)).astype(np.uint8)
+    # Combine the 100% solid painted area with the original image
+    final_output = (painted_rgb * soft_mask_3d + image * (1.0 - soft_mask_3d)).astype(np.uint8)
     
     return final_output
