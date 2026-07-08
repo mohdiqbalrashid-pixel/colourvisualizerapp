@@ -10,7 +10,10 @@ from modules.recolouring import apply_paint
 
 def _apply_and_save_paint():
     """Helper function to quickly apply paint when masks change."""
-    original_image = st.session_state["uploaded_image"]
+    original_image = st.session_state.get("uploaded_image")
+    if original_image is None:
+        return
+        
     mask = st.session_state.get("wall_mask")
     color = st.session_state.get("selected_colour", (186, 12, 47))
     strength = st.session_state.get("paint_strength", 1.0)
@@ -20,14 +23,15 @@ def _apply_and_save_paint():
         st.session_state["painted_image"] = painted
 
 def build_preview() -> None:
-    if st.session_state.get("uploaded_image") is None:
+    original_image = st.session_state.get("uploaded_image")
+    if original_image is None:
         st.info("👈 Please upload an image in the sidebar to get started.")
         return
 
-    original_image = st.session_state["uploaded_image"]
-    
-    # Use the painted image if it exists. This fixes the "Image below" issue!
-    display_image = st.session_state.get("painted_image", original_image)
+    # THE FIX: Explicitly check for None instead of relying on .get() default
+    display_image = st.session_state.get("painted_image")
+    if display_image is None:
+        display_image = original_image
     
     st.subheader("Interactive Workspace")
     
