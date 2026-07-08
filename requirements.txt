@@ -1,5 +1,6 @@
 streamlit
 streamlit-image-coordinates
+streamlit-drawable-canvas
 numpy
 pandas
 opencv-contrib-python-headless
