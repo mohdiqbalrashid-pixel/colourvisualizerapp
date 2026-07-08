@@ -4,3 +4,5 @@ numpy
 pandas
 opencv-contrib-python-headless
 pillow
+replicate
+requests
