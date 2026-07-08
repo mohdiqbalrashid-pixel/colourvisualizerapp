@@ -23,7 +23,7 @@ def _undo_last_action():
         _apply_and_save_paint()
         st.session_state["polygon_points"] = []
 
-# --- PAINT ENGINE ---
+# --- PAINT ENGINE WITH EDGE SHIFTING ---
 def _apply_and_save_paint():
     original_image = st.session_state.get("uploaded_image")
     if original_image is None:
@@ -32,9 +32,20 @@ def _apply_and_save_paint():
     mask = st.session_state.get("wall_mask")
     color = st.session_state.get("selected_colour", (186, 12, 47))
     strength = st.session_state.get("paint_strength", 1.0)
+    edge_shift = st.session_state.get("edge_shift", 0)
     
     if mask is not None:
-        painted = apply_paint(original_image, mask, color, strength)
+        working_mask = mask.copy()
+        
+        # Apply mathematical expansion (dilate) or shrinking (erode)
+        if edge_shift > 0:
+            kernel = np.ones((3, 3), np.uint8)
+            working_mask = cv2.dilate(working_mask, kernel, iterations=edge_shift)
+        elif edge_shift < 0:
+            kernel = np.ones((3, 3), np.uint8)
+            working_mask = cv2.erode(working_mask, kernel, iterations=abs(edge_shift))
+            
+        painted = apply_paint(original_image, working_mask, color, strength)
         st.session_state["painted_image"] = painted
 
 def build_preview() -> None:
@@ -51,7 +62,6 @@ def build_preview() -> None:
         st.session_state["wall_mask"] = np.zeros(original_image.shape[:2], dtype=np.uint8)
     
     # --- AUTO-DETECTION ENGINE ---
-    # Only calculate this once per newly uploaded image to save processing power
     image_id = id(original_image)
     if st.session_state.get("last_processed_image_id") != image_id:
         with st.spinner("🤖 AI mapping room geometry..."):
@@ -67,7 +77,6 @@ def build_preview() -> None:
             if col.button(f"Paint Surface {i+1}", use_container_width=True):
                 _save_state_to_history()
                 
-                # Apply the auto-mask
                 click_mode = st.session_state.get("click_mode", "New Wall 🔄")
                 if "Add" in click_mode:
                     st.session_state["wall_mask"] = cv2.bitwise_or(st.session_state["wall_mask"], auto_mask)
@@ -81,11 +90,26 @@ def build_preview() -> None:
 
     st.subheader("Interactive Workspace")
     
-    col_title, col_undo = st.columns([3, 1])
-    with col_undo:
+    # --- GLOBAL WORKSPACE CONTROLS ---
+    ctrl_col1, ctrl_col2 = st.columns([2, 1])
+    with ctrl_col1:
+        # The new Edge Shifter slider
+        new_edge_shift = st.slider(
+            "↔️ Fine-tune Edges (Shrink ➖ | Expand ➕)", 
+            min_value=-15, max_value=15, value=st.session_state.get("edge_shift", 0), step=1
+        )
+        # Re-calculate the paint only if the slider was actually moved
+        if new_edge_shift != st.session_state.get("edge_shift", 0):
+            st.session_state["edge_shift"] = new_edge_shift
+            _apply_and_save_paint()
+            st.rerun()
+            
+    with ctrl_col2:
+        st.markdown("<br>", unsafe_allow_html=True) # Formatting alignment
         st.button("↩️ Undo Last Action", on_click=_undo_last_action, use_container_width=True, 
                   disabled=not bool(st.session_state.get("mask_history")))
     
+    # --- INTERACTIVE TABS ---
     tab1, tab2 = st.tabs(["🪄 AI Magic Wand", "🖌️ Manual Touch-ups"])
     
     with tab1:
