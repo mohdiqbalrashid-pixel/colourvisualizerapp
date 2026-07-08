@@ -1,76 +1,80 @@
 from __future__ import annotations
 
-import os
-import tempfile
-import streamlit as st
-import replicate
-import requests
-import numpy as np
 import cv2
-from io import BytesIO
-from PIL import Image
+import numpy as np
 
-# Securely load the API token from Streamlit Cloud Secrets
-if "REPLICATE_API_TOKEN" in st.secrets:
-    os.environ["REPLICATE_API_TOKEN"] = st.secrets["REPLICATE_API_TOKEN"]
+from modules.config import (
+    MASK_EXPAND_PIXELS,
+    MASK_SHRINK_PIXELS,
+    MASK_SMOOTH_KERNEL
+)
 
-def _get_sam_mask_from_api(image: np.ndarray, click_point: tuple[int, int]) -> np.ndarray:
+def _generate_local_grabcut_mask(image: np.ndarray, seed_point: tuple[int, int]) -> np.ndarray:
     """
-    Sends the image and click coordinates to SAM via Replicate API.
-    Returns a perfect, context-aware AI mask.
+    Uses OpenCV's GrabCut algorithm locally. 
+    100% Free, runs entirely on Streamlit Cloud without external APIs.
     """
-    x, y = click_point
+    height, width = image.shape[:2]
+    x, y = seed_point
     
-    # 1. Convert OpenCV array to a PIL Image
-    img_pil = Image.fromarray(image)
+    mask = np.zeros((height, width), np.uint8)
+    bgd_model = np.zeros((1, 65), np.float64)
+    fgd_model = np.zeros((1, 65), np.float64)
     
-    # 2. Save it to a temporary file for secure upload
-    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as temp_img:
-        img_pil.save(temp_img, format='JPEG', quality=85)
-        temp_path = temp_img.name
+    # Set the whole image as 'Probable Background'
+    mask[:] = cv2.GC_PR_BGD
+    
+    # Mark the clicked area as 'Definite Foreground'
+    # We use an ellipse that stretches slightly to capture more of the wall's base color
+    cv2.ellipse(mask, (x, y), (60, 40), 0, 0, 360, cv2.GC_FGD, -1)
+    
+    # Give the algorithm a bounding box to work within
+    rect = (5, 5, width - 10, height - 10)
     
     try:
-        # 3. Open the file and hand it to a version-pinned Replicate model
-        with open(temp_path, "rb") as file_handle:
-            # We use a specific, immutable version hash so it never breaks or updates unexpectedly
-            outputs = replicate.run(
-                "datong-new/sam-point:ddae29125730397cd9bd25fa2c5212e5411c6dcaa02334a63db767a78fefa21b",
-                input={
-                    "image": file_handle,
-                    "input_points": f"[[{x},{y}]]" 
-                }
-            )
-            
-        # 4. Clean up the temporary file immediately
-        os.remove(temp_path)
+        # Run GrabCut for 3 iterations (balance between speed and accuracy)
+        cv2.grabCut(image, mask, rect, bgd_model, fgd_model, 3, cv2.GC_INIT_WITH_MASK)
         
-        # 5. This specific model returns a list of outputs; we extract the first one
-        mask_url = outputs[0] if isinstance(outputs, list) else outputs
+        # Extract the foreground (1) and probable foreground (3)
+        binary_mask = np.where((mask == 1) | (mask == 3), 255, 0).astype("uint8")
+    except Exception:
+        binary_mask = np.zeros((height, width), dtype=np.uint8)
         
-        # 6. Download the resulting mask and convert it back to an OpenCV array
-        response = requests.get(mask_url)
-        mask_img = Image.open(BytesIO(response.content)).convert("L")
-        return np.array(mask_img)
+    return binary_mask
+
+def _refine_edges(image: np.ndarray, raw_mask: np.ndarray) -> np.ndarray:
+    """
+    Snaps the mask cleanly to doorframes and ceilings using the image's physical edges.
+    """
+    guide = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    
+    try:
+        refined_mask = cv2.ximgproc.guidedFilter(
+            guide=guide, src=raw_mask, radius=MASK_SMOOTH_KERNEL, eps=1e-4
+        )
+    except AttributeError:
+        refined_mask = cv2.GaussianBlur(raw_mask, (MASK_SMOOTH_KERNEL, MASK_SMOOTH_KERNEL), 0)
+    
+    # Morphological adjustments to fill micro-holes
+    if MASK_EXPAND_PIXELS > 0:
+        kernel = np.ones((MASK_EXPAND_PIXELS, MASK_EXPAND_PIXELS), np.uint8)
+        refined_mask = cv2.dilate(refined_mask, kernel, iterations=1)
         
-    except Exception as e:
-        # Failsafe: Clean up the file if an error occurs and return an empty mask
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-        st.error(f"AI Connection Error: {e}")
-        return np.zeros(image.shape[:2], dtype=np.uint8)
+    if MASK_SHRINK_PIXELS > 0:
+        kernel = np.ones((MASK_SHRINK_PIXELS, MASK_SHRINK_PIXELS), np.uint8)
+        refined_mask = cv2.erode(refined_mask, kernel, iterations=1)
+        
+    return np.clip(refined_mask, 0, 255).astype(np.uint8)
 
 def create_wall_mask(image: np.ndarray, seed_point: tuple[int, int]) -> np.ndarray:
-    """
-    Main entry point for preview.py.
-    Checks to ensure the click is within the image, then calls the AI.
-    """
+    """Main entry point for preview.py"""
     height, width = image.shape[:2]
     x, y = seed_point
     
     if not (0 <= x < width and 0 <= y < height):
         return np.zeros((height, width), dtype=np.uint8)
 
-    # Trigger the AI Segment Anything Model
-    final_mask = _get_sam_mask_from_api(image, (x, y))
+    raw_mask = _generate_local_grabcut_mask(image, (x, y))
+    final_mask = _refine_edges(image, raw_mask)
     
     return final_mask
