@@ -1,7 +1,6 @@
 streamlit
 streamlit-image-coordinates
-streamlit-drawable-canvas>=0.9.3
-numpy<2.0.0
+numpy
 pandas
 opencv-contrib-python-headless
 pillow
