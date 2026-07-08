@@ -25,7 +25,7 @@ def _generate_local_grabcut_mask(image: np.ndarray, seed_point: tuple[int, int])
     mask[:] = cv2.GC_PR_BGD
     
     # Mark the clicked area as 'Definite Foreground'
-    # We use an ellipse that stretches slightly to capture more of the wall's base color
+    # We use an ellipse to capture a good sample of the wall's base color
     cv2.ellipse(mask, (x, y), (60, 40), 0, 0, 360, cv2.GC_FGD, -1)
     
     # Give the algorithm a bounding box to work within
