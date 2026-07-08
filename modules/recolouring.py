@@ -1,79 +1,53 @@
-from __future__ import annotations
-
 import cv2
 import numpy as np
 
-from modules.config import DEFAULT_PAINT_STRENGTH
-
-def _create_boundary_alpha(mask: np.ndarray, strength: float) -> np.ndarray:
-    """
-    Generates feathered transitions for seamless paint edges.
-    """
-    base = mask.astype(np.float32) / 255.0
-    base = np.clip(base, 0.0, 1.0)
-    
-    binary = (base > 0.05).astype(np.uint8)
-    if not np.any(binary > 0):
-        return np.zeros_like(base, dtype=np.float32)
-        
-    soft = cv2.GaussianBlur(base, (11, 11), 0)
-    return np.clip(soft * float(strength), 0.0, 1.0)
-
 def apply_paint(
-    image_np: np.ndarray,
-    mask: np.ndarray,
-    target_rgb: tuple[int, int, int],
-    strength: float = DEFAULT_PAINT_STRENGTH,
+    image: np.ndarray, 
+    mask: np.ndarray, 
+    target_rgb: tuple[int, int, int], 
+    strength: float = 1.0
 ) -> np.ndarray:
     """
-    High accuracy paint simulation using luminance shifts in CIELAB color space.
+    Applies paint using advanced Multiply and Screen blending modes
+    for photorealistic shadow and highlight retention.
     """
-    if image_np is None or mask is None:
-        return image_np
-
-    # Form verification
-    if image_np.dtype != np.uint8:
-        image_uint8 = np.clip(image_np, 0, 255).astype(np.uint8)
-    else:
-        image_uint8 = image_np.copy()
-        
+    # Ensure formats
     if mask.ndim == 3:
-        mask_uint8 = cv2.cvtColor(mask, cv2.COLOR_RGB2GRAY)
-    else:
-        mask_uint8 = mask.astype(np.uint8)
-
-    alpha = _create_boundary_alpha(mask_uint8, strength)
-    if not np.any(alpha > 0):
-        return image_uint8
-
-    # Convert source scene and destination swatch into LAB space
-    image_lab = cv2.cvtColor(image_uint8, cv2.COLOR_RGB2LAB).astype(np.float32)
+        mask = cv2.cvtColor(mask, cv2.COLOR_RGB2GRAY)
     
-    target_rgb_array = np.uint8([[target_rgb]])
-    target_lab = cv2.cvtColor(target_rgb_array, cv2.COLOR_RGB2LAB)[0][0].astype(np.float32)
-    target_l, target_a, target_b = target_lab
-
-    l_channel, a_channel, b_channel = cv2.split(image_lab)
-    bool_mask = mask_uint8 > 0
+    # Create the solid color layer
+    solid_color = np.full_like(image, target_rgb, dtype=np.float32)
+    img_float = image.astype(np.float32)
     
-    # Balance luminosity relative to contextual source illumination averages
-    avg_original_l = np.mean(l_channel[bool_mask]) if np.any(bool_mask) else 128.0
-    l_shift = target_l - avg_original_l
+    # Normalize original image for calculations (0.0 to 1.0)
+    img_normalized = img_float / 255.0
+    color_normalized = solid_color / 255.0
     
-    # Factor shifting and combine
-    shifted_l = np.clip(l_channel + l_shift, 0.0, 255.0)
+    # 1. MULTIPLY BLEND (Perfect for shadows)
+    # This darkens the new color based on the shadows in the original wall
+    multiply_blend = img_normalized * color_normalized
     
-    # Allocate properties
-    l_channel[bool_mask] = shifted_l[bool_mask]
-    a_channel[bool_mask] = target_a
-    b_channel[bool_mask] = target_b
+    # 2. SCREEN BLEND (Perfect for highlights)
+    # This ensures glare from windows/lights reflects realistically off the new paint
+    screen_blend = 1.0 - (1.0 - img_normalized) * (1.0 - color_normalized)
     
-    # Reassemble and transition safely back to RGB space
-    modified_lab = cv2.merge([l_channel, a_channel, b_channel])
-    modified_rgb = cv2.cvtColor(np.clip(modified_lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB)
+    # 3. LUMINANCE MASKING (The secret sauce)
+    # We use the original wall's brightness to mix the Multiply and Screen layers.
+    # Dark areas get the Multiply blend; bright areas get the Screen blend.
+    gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
+    gray_3d = np.dstack([gray, gray, gray])
     
-    # Blend target area using mask opacity profiles
-    alpha_3d = np.dstack([alpha] * 3)
-    final_output = (modified_rgb * alpha_3d + image_uint8 * (1.0 - alpha_3d)).astype(np.uint8)
+    # Combine them based on the wall's lighting
+    blended_normalized = (multiply_blend * (1.0 - gray_3d)) + (screen_blend * gray_3d)
+    
+    # Convert back to standard image format
+    blended_final = (blended_normalized * 255.0).clip(0, 255).astype(np.uint8)
+    
+    # Feather the mask for seamless edges
+    soft_mask = cv2.GaussianBlur(mask, (15, 15), 0).astype(np.float32) / 255.0
+    soft_mask_3d = np.dstack([soft_mask, soft_mask, soft_mask]) * strength
+    
+    # Apply only where the AI mask says the wall is
+    final_output = (blended_final * soft_mask_3d + image * (1.0 - soft_mask_3d)).astype(np.uint8)
     
     return final_output
