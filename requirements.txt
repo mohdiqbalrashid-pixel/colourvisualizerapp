@@ -1,0 +1,6 @@
+streamlit
+streamlit-image-coordinates
+numpy
+pandas
+opencv-contrib-python-headless
+pillow
