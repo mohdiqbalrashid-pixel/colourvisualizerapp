@@ -3,34 +3,28 @@ import cv2
 import numpy as np
 from streamlit_image_coordinates import streamlit_image_coordinates
 
-from modules.segmentation import create_wall_mask
+from modules.segmentation import create_wall_mask, generate_auto_regions
 from modules.recolouring import apply_paint
 
 # --- UNDO ENGINE ---
 def _save_state_to_history():
-    """Saves the current mask to memory before we change it."""
     if "mask_history" not in st.session_state:
         st.session_state["mask_history"] = []
         
     current_mask = st.session_state.get("wall_mask")
     if current_mask is not None:
-        # Save a copy to the stack
         st.session_state["mask_history"].append(current_mask.copy())
-        
-        # Keep memory clean (limit to 15 undo steps)
         if len(st.session_state["mask_history"]) > 15:
             st.session_state["mask_history"].pop(0)
 
 def _undo_last_action():
-    """Restores the mask from the last saved state."""
     if st.session_state.get("mask_history"):
         st.session_state["wall_mask"] = st.session_state["mask_history"].pop()
         _apply_and_save_paint()
-        st.session_state["polygon_points"] = [] # Clear any half-drawn polygons
+        st.session_state["polygon_points"] = []
 
 # --- PAINT ENGINE ---
 def _apply_and_save_paint():
-    """Applies the Jotun colour to the final mask."""
     original_image = st.session_state.get("uploaded_image")
     if original_image is None:
         return
@@ -43,7 +37,6 @@ def _apply_and_save_paint():
         painted = apply_paint(original_image, mask, color, strength)
         st.session_state["painted_image"] = painted
 
-
 def build_preview() -> None:
     original_image = st.session_state.get("uploaded_image")
     if original_image is None:
@@ -54,13 +47,40 @@ def build_preview() -> None:
     if display_image is None:
         display_image = original_image
     
-    # Initialize mask if it doesn't exist yet
     if st.session_state.get("wall_mask") is None:
         st.session_state["wall_mask"] = np.zeros(original_image.shape[:2], dtype=np.uint8)
     
+    # --- AUTO-DETECTION ENGINE ---
+    # Only calculate this once per newly uploaded image to save processing power
+    image_id = id(original_image)
+    if st.session_state.get("last_processed_image_id") != image_id:
+        with st.spinner("🤖 AI mapping room geometry..."):
+            st.session_state["auto_masks"] = generate_auto_regions(original_image)
+            st.session_state["last_processed_image_id"] = image_id
+
+    # Display the 1-Click Fast Paint buttons
+    if st.session_state.get("auto_masks"):
+        st.write("⚡ **Fast Paint:** Auto-Detected Surfaces")
+        cols = st.columns(len(st.session_state["auto_masks"]))
+        
+        for i, (col, auto_mask) in enumerate(zip(cols, st.session_state["auto_masks"])):
+            if col.button(f"Paint Surface {i+1}", use_container_width=True):
+                _save_state_to_history()
+                
+                # Apply the auto-mask
+                click_mode = st.session_state.get("click_mode", "New Wall 🔄")
+                if "Add" in click_mode:
+                    st.session_state["wall_mask"] = cv2.bitwise_or(st.session_state["wall_mask"], auto_mask)
+                else:
+                    st.session_state["wall_mask"] = auto_mask
+                    
+                _apply_and_save_paint()
+                st.rerun()
+                
+        st.divider()
+
     st.subheader("Interactive Workspace")
     
-    # The Global Undo Button
     col_title, col_undo = st.columns([3, 1])
     with col_undo:
         st.button("↩️ Undo Last Action", on_click=_undo_last_action, use_container_width=True, 
@@ -68,9 +88,6 @@ def build_preview() -> None:
     
     tab1, tab2 = st.tabs(["🪄 AI Magic Wand", "🖌️ Manual Touch-ups"])
     
-    # ==========================================
-    # TAB 1: AI MAGIC WAND
-    # ==========================================
     with tab1:
         st.caption("Click any shadow or missed spot to automatically fill it.")
         
@@ -86,8 +103,7 @@ def build_preview() -> None:
                 tolerance = st.session_state.get("tolerance", 20)
                 
                 with st.spinner("Calculating..."):
-                    _save_state_to_history() # Save state before AI runs
-                    
+                    _save_state_to_history()
                     new_chunk = create_wall_mask(original_image, point, tolerance)
                     current_mask = st.session_state.get("wall_mask")
                     
@@ -101,9 +117,6 @@ def build_preview() -> None:
                 _apply_and_save_paint()
                 st.rerun() 
                 
-    # ==========================================
-    # TAB 2: MANUAL BRUSH & POLYGONS
-    # ==========================================
     with tab2:
         if "polygon_points" not in st.session_state:
             st.session_state["polygon_points"] = []
@@ -119,7 +132,6 @@ def build_preview() -> None:
             else:
                 if st.button("Apply Shape", use_container_width=True) and len(st.session_state["polygon_points"]) > 2:
                     _save_state_to_history()
-                    
                     pts = np.array(st.session_state["polygon_points"], np.int32).reshape((-1, 1, 2))
                     poly_mask = np.zeros(original_image.shape[:2], dtype=np.uint8)
                     cv2.fillPoly(poly_mask, [pts], 255)
@@ -134,10 +146,8 @@ def build_preview() -> None:
                     _apply_and_save_paint()
                     st.rerun()
 
-        # Visual feedback layer
         interactive_display = display_image.copy()
         
-        # Draw polygon anchor points if using polygon tool
         if tool == "Polygon 📐":
             points = st.session_state["polygon_points"]
             for i, pt in enumerate(points):
@@ -147,27 +157,22 @@ def build_preview() -> None:
             if len(points) > 2:
                 cv2.line(interactive_display, points[-1], points[0], (255, 0, 180), 2)
                 
-        # Register the click
         manual_click = streamlit_image_coordinates(interactive_display, key="manual_clicker")
         
         if manual_click is not None:
             new_point = (manual_click["x"], manual_click["y"])
             
-            # BRUSH LOGIC
             if tool == "Brush 🔴":
                 if st.session_state.get("last_brush_click") != new_point:
                     st.session_state["last_brush_click"] = new_point
-                    
                     _save_state_to_history()
                     
-                    # Stamp a perfect circle of paint (or eraser) onto the mask
                     color_val = 255 if "Add" in manual_action else 0
                     cv2.circle(st.session_state["wall_mask"], new_point, brush_size, color_val, -1)
                     
                     _apply_and_save_paint()
                     st.rerun()
                     
-            # POLYGON LOGIC
             elif tool == "Polygon 📐":
                 points = st.session_state["polygon_points"]
                 if not points or points[-1] != new_point:
