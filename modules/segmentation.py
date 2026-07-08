@@ -7,6 +7,7 @@ from modules.config import MASK_SMOOTH_KERNEL
 def create_wall_mask(image: np.ndarray, seed_point: tuple[int, int], tolerance: int = 20) -> np.ndarray:
     """
     Generates a wall mask using LAB color space and a tolerance threshold.
+    Used for the manual 'Magic Wand' click tool in the interactive workspace.
     """
     height, width = image.shape[:2]
     x, y = seed_point
@@ -16,6 +17,7 @@ def create_wall_mask(image: np.ndarray, seed_point: tuple[int, int], tolerance: 
 
     lab_image = cv2.cvtColor(image, cv2.COLOR_RGB2LAB)
     
+    # FloodFill requires a mask exactly 2 pixels larger than the image
     mask = np.zeros((height + 2, width + 2), np.uint8)
     lo_diff = (tolerance, tolerance, tolerance)
     up_diff = (tolerance, tolerance, tolerance)
@@ -28,9 +30,11 @@ def create_wall_mask(image: np.ndarray, seed_point: tuple[int, int], tolerance: 
     
     raw_mask = mask[1:height+1, 1:width+1]
     
+    # Close small holes
     kernel = np.ones((5, 5), np.uint8)
     raw_mask = cv2.morphologyEx(raw_mask, cv2.MORPH_CLOSE, kernel)
     
+    # Snap cleanly to edges
     guide = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
     try:
         final_mask = cv2.ximgproc.guidedFilter(
@@ -46,86 +50,44 @@ def create_wall_mask(image: np.ndarray, seed_point: tuple[int, int], tolerance: 
 
 def generate_auto_regions(image: np.ndarray, num_regions: int = 3) -> list[np.ndarray]:
     """
-    Uses Graph-Based Segmentation and Canny Edge Fencing to auto-detect walls flawlessly.
+    Uses Graph-Based Segmentation with CLAHE Illumination Flattening and Canny Fencing.
+    Used for the instant '0-Click' auto-detection buttons.
     """
     height, width = image.shape[:2]
     
-    # 1. Downscale for lightning-fast processing
+    # Downscale for lightning-fast processing
     scale = 400.0 / max(width, height)
     new_w, new_h = int(width * scale), int(height * scale)
     small_img = cv2.resize(image, (new_w, new_h))
 
-    # 2. Extract Hard Structural Edges (Doorframes, Windows, Ceilings)
-    # We build a mathematical "fence" that stops the detection from bleeding over
-    gray = cv2.cvtColor(small_img, cv2.COLOR_RGB2GRAY)
+    # --- ILLUMINATION FLATTENING (CLAHE) ---
+    lab = cv2.cvtColor(small_img, cv2.COLOR_RGB2LAB)
+    l_channel, a, b = cv2.split(lab)
+    
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    cl = clahe.apply(l_channel)
+    
+    limg = cv2.merge((cl, a, b))
+    flat_img = cv2.cvtColor(limg, cv2.COLOR_LAB2RGB)
+
+    # --- HARD STRUCTURAL EDGES (FENCE) ---
+    gray = cv2.cvtColor(flat_img, cv2.COLOR_RGB2GRAY)
     edges = cv2.Canny(gray, 30, 100)
     edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=2)
 
-    # 3. Graph-Based Segmentation (Felzenszwalb's Algorithm)
-    # This understands that a shadow on a wall is a smooth slope, keeping the wall whole.
-    blurred = cv2.bilateralFilter(small_img, d=9, sigmaColor=75, sigmaSpace=75)
+    # --- GRAPH-BASED SEGMENTATION ---
+    blurred = cv2.bilateralFilter(flat_img, d=9, sigmaColor=75, sigmaSpace=75)
     
     try:
-        # k=400 heavily favors creating large, contiguous surfaces (walls) rather than tiny fragments
         segmenter = cv2.ximgproc.segmentation.createGraphSegmentation(
             sigma=0.5, k=400, min_size=int(new_w * new_h * 0.08)
         )
         labels = segmenter.processImage(blurred)
     except AttributeError:
-        # Failsafe: Fallback to K-Means if Streamlit cloud environment hiccups
-        lab_img = cv2.cvtColor(blurred, cv2.COLOR_RGB2LAB)
-        pixel_values = lab_img.reshape((-1, 3)).astype(np.float32)
+        # Fallback to K-Means if Graph Segmentation fails in the environment
+        pixel_values = blurred.reshape((-1, 3)).astype(np.float32)
         criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
         _, labels, _ = cv2.kmeans(pixel_values, 6, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
         labels = labels.reshape((new_h, new_w))
 
-    unique_labels, counts = np.unique(labels, return_counts=True)
-    sorted_labels = [l for _, l in sorted(zip(counts, unique_labels), reverse=True)]
-
-    masks = []
-    total_area = new_w * new_h
-
-    for label in sorted_labels:
-        mask_small = np.where(labels == label, 255, 0).astype(np.uint8)
-        
-        # 4. Enforce the Edge Fence (Cut out the doorframes/windows)
-        mask_small = cv2.bitwise_and(mask_small, cv2.bitwise_not(edges))
-        
-        # Clean up microscopic fragments left behind by the fence subtraction
-        kernel = np.ones((5, 5), np.uint8)
-        mask_small = cv2.morphologyEx(mask_small, cv2.MORPH_OPEN, kernel)
-        
-        # Extract the single largest continuous chunk in this label
-        num_labels, labels_im, stats, _ = cv2.connectedComponentsWithStats(mask_small, connectivity=8)
-        if num_labels > 1:
-            largest_label = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
-            mask_small = np.where(labels_im == largest_label, 255, 0).astype(np.uint8)
-
-        area = np.count_nonzero(mask_small)
-        
-        # Rule A: Surface must take up at least 8% of the room to be considered a main wall
-        if area / total_area < 0.08: 
-            continue
-
-        # 5. Gravity Check (Ignore Floors/Rugs)
-        touches_top = np.any(mask_small[0:5, :] > 0)
-        touches_left = np.any(mask_small[:, 0:5] > 0)
-        touches_right = np.any(mask_small[:, -5:] > 0)
-        touches_bottom = np.any(mask_small[-5:, :] > 0)
-
-        # If it ONLY touches the bottom of the photo, it is the floor. Discard it.
-        if touches_bottom and not (touches_top or touches_left or touches_right):
-            continue
-
-        # 6. Scale back to original massive resolution and feather edges for realism
-        mask_large = cv2.resize(mask_small, (width, height), interpolation=cv2.INTER_NEAREST)
-        mask_large = cv2.GaussianBlur(mask_large, (15, 15), 0)
-        _, mask_large = cv2.threshold(mask_large, 127, 255, cv2.THRESH_BINARY)
-
-        masks.append(mask_large)
-        
-        # Stop once we've found the top requested surfaces
-        if len(masks) == num_regions:
-            break
-
-    return masks
+    unique_labels, counts = np.
