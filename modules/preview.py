@@ -1,15 +1,13 @@
 import streamlit as st
 import cv2
 import numpy as np
-from PIL import Image
 from streamlit_image_coordinates import streamlit_image_coordinates
-from streamlit_drawable_canvas import st_canvas
 
 from modules.segmentation import create_wall_mask
 from modules.recolouring import apply_paint
 
 def _apply_and_save_paint():
-    """Helper function to quickly apply paint when masks change."""
+    """Helper function to apply paint when masks change."""
     original_image = st.session_state.get("uploaded_image")
     if original_image is None:
         return
@@ -28,28 +26,25 @@ def build_preview() -> None:
         st.info("👈 Please upload an image in the sidebar to get started.")
         return
 
-    # THE FIX: Explicitly check for None instead of relying on .get() default
     display_image = st.session_state.get("painted_image")
     if display_image is None:
         display_image = original_image
     
     st.subheader("Interactive Workspace")
     
-    # Create Professional Tabs for different tools
     tab1, tab2 = st.tabs(["🪄 AI Magic Wand", "📐 Manual Polygons"])
     
     with tab1:
         st.caption("Click any shadow or missed spot to automatically fill it.")
         
-        # Render the image for clicking
         click_data = streamlit_image_coordinates(display_image, key="ai_wand")
         
         if click_data is not None:
             point = (click_data["x"], click_data["y"])
             
-            # Only trigger if they clicked a new location
-            if st.session_state.get("selected_surface_point") != point:
-                st.session_state["selected_surface_point"] = point
+            # Prevent infinite reloading loops
+            if st.session_state.get("last_ai_click") != point:
+                st.session_state["last_ai_click"] = point
                 
                 click_mode = st.session_state.get("click_mode", "Add to Wall ➕")
                 tolerance = st.session_state.get("tolerance", 20)
@@ -66,47 +61,65 @@ def build_preview() -> None:
                         st.session_state["wall_mask"] = cv2.bitwise_and(current_mask, cv2.bitwise_not(new_chunk))
                     
                 _apply_and_save_paint()
-                st.rerun() # Refresh the interface to show the new paint instantly
+                st.rerun() 
                 
     with tab2:
-        st.caption("Click around a shape to draw a polygon. Double-click to close the shape.")
+        st.caption("Click multiple points on the image to draw a shape. Click 'Apply Shape' to fill it.")
         
-        col1, col2 = st.columns(2)
+        # Initialize our anchor point memory
+        if "polygon_points" not in st.session_state:
+            st.session_state["polygon_points"] = []
+            
+        col1, col2, col3 = st.columns([2, 1, 1])
         with col1:
             manual_action = st.radio("Polygon Action", ["Add Paint ➕", "Erase Paint ➖"], horizontal=True)
         with col2:
-            if st.button("Apply Polygon Area", use_container_width=True):
-                if st.session_state.get("last_canvas_mask") is not None:
-                    drawn_mask = st.session_state["last_canvas_mask"]
-                    current_mask = st.session_state.get("wall_mask")
+            # Only allow apply if they've drawn a proper shape (3 or more points)
+            if st.button("Apply Shape", use_container_width=True) and len(st.session_state["polygon_points"]) > 2:
+                # 1. Convert the user's clicked points into an OpenCV polygon
+                pts = np.array(st.session_state["polygon_points"], np.int32).reshape((-1, 1, 2))
+                poly_mask = np.zeros(original_image.shape[:2], dtype=np.uint8)
+                cv2.fillPoly(poly_mask, [pts], 255)
+                
+                # 2. Merge it with our existing wall mask
+                current_mask = st.session_state.get("wall_mask")
+                if current_mask is None:
+                    current_mask = np.zeros(original_image.shape[:2], dtype=np.uint8)
                     
-                    if current_mask is None:
-                        current_mask = np.zeros(original_image.shape[:2], dtype=np.uint8)
-                        
-                    # Merge the user's drawn shape with the AI mask
-                    if "Add" in manual_action:
-                        st.session_state["wall_mask"] = cv2.bitwise_or(current_mask, drawn_mask)
-                    else:
-                        st.session_state["wall_mask"] = cv2.bitwise_and(current_mask, cv2.bitwise_not(drawn_mask))
-                        
-                    _apply_and_save_paint()
-                    st.rerun()
+                if "Add" in manual_action:
+                    st.session_state["wall_mask"] = cv2.bitwise_or(current_mask, poly_mask)
+                else:
+                    st.session_state["wall_mask"] = cv2.bitwise_and(current_mask, cv2.bitwise_not(poly_mask))
+                    
+                # 3. Clear points and repaint!
+                st.session_state["polygon_points"] = []
+                _apply_and_save_paint()
+                st.rerun()
+                
+        with col3:
+            if st.button("Clear Points", use_container_width=True):
+                st.session_state["polygon_points"] = []
+                st.rerun()
         
-        # The interactive drawing canvas
-        canvas_result = st_canvas(
-            fill_color="rgba(255, 0, 180, 0.4)", # Semi-transparent pink drawing guide
-            stroke_width=2,
-            stroke_color="#FF00B4",
-            background_image=Image.fromarray(display_image),
-            update_streamlit=True,
-            height=display_image.shape[0],
-            width=display_image.shape[1],
-            drawing_mode="polygon",
-            key="polygon_canvas",
-        )
+        # Visually draw the polygon on a temporary canvas for the user
+        poly_display = display_image.copy()
+        points = st.session_state["polygon_points"]
         
-        # Extract the shape the user drew into a Numpy array mask behind the scenes
-        if canvas_result.image_data is not None:
-            alpha_channel = canvas_result.image_data[:, :, 3]
-            binary_drawn_mask = np.where(alpha_channel > 0, 255, 0).astype(np.uint8)
-            st.session_state["last_canvas_mask"] = binary_drawn_mask
+        for i, pt in enumerate(points):
+            cv2.circle(poly_display, pt, 5, (255, 0, 180), -1) # Draw anchor dot
+            if i > 0:
+                cv2.line(poly_display, points[i-1], pt, (255, 0, 180), 2) # Draw connecting line
+        
+        # Close the shape visually if they have enough points
+        if len(points) > 2:
+            cv2.line(poly_display, points[-1], points[0], (255, 0, 180), 2)
+        
+        # Render the clickable image
+        poly_click = streamlit_image_coordinates(poly_display, key="poly_clicker")
+        
+        if poly_click is not None:
+            new_point = (poly_click["x"], poly_click["y"])
+            # Only add the point if it's new (prevents double-firing)
+            if not points or points[-1] != new_point:
+                st.session_state["polygon_points"].append(new_point)
+                st.rerun()
