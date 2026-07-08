@@ -90,4 +90,52 @@ def generate_auto_regions(image: np.ndarray, num_regions: int = 3) -> list[np.nd
         _, labels, _ = cv2.kmeans(pixel_values, 6, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
         labels = labels.reshape((new_h, new_w))
 
-    unique_labels, counts = np.
+    unique_labels, counts = np.unique(labels, return_counts=True)
+    sorted_labels = [l for _, l in sorted(zip(counts, unique_labels), reverse=True)]
+
+    masks = []
+    total_area = new_w * new_h
+
+    for label in sorted_labels:
+        mask_small = np.where(labels == label, 255, 0).astype(np.uint8)
+        
+        # Enforce the edge fence (subtract doorframes/windows)
+        mask_small = cv2.bitwise_and(mask_small, cv2.bitwise_not(edges))
+        
+        # Clean up microscopic fragments left by the fence
+        kernel = np.ones((5, 5), np.uint8)
+        mask_small = cv2.morphologyEx(mask_small, cv2.MORPH_OPEN, kernel)
+        
+        # Extract the single largest continuous chunk
+        num_labels, labels_im, stats, _ = cv2.connectedComponentsWithStats(mask_small, connectivity=8)
+        if num_labels > 1:
+            largest_label = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+            mask_small = np.where(labels_im == largest_label, 255, 0).astype(np.uint8)
+
+        area = np.count_nonzero(mask_small)
+        
+        # Rule A: Surface must take up at least 8% of the room
+        if area / total_area < 0.08: 
+            continue
+
+        # Rule B: Gravity Check (Ignore floors/rugs)
+        touches_top = np.any(mask_small[0:5, :] > 0)
+        touches_left = np.any(mask_small[:, 0:5] > 0)
+        touches_right = np.any(mask_small[:, -5:] > 0)
+        touches_bottom = np.any(mask_small[-5:, :] > 0)
+
+        if touches_bottom and not (touches_top or touches_left or touches_right):
+            continue
+
+        # Scale back to original massive resolution and feather edges for realism
+        mask_large = cv2.resize(mask_small, (width, height), interpolation=cv2.INTER_NEAREST)
+        mask_large = cv2.GaussianBlur(mask_large, (15, 15), 0)
+        _, mask_large = cv2.threshold(mask_large, 127, 255, cv2.THRESH_BINARY)
+
+        masks.append(mask_large)
+        
+        # Stop once we've found the top requested surfaces
+        if len(masks) == num_regions:
+            break
+
+    return masks
