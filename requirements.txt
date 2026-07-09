@@ -4,3 +4,4 @@ numpy
 pandas
 opencv-contrib-python-headless
 pillow
+rembg[cpu]
